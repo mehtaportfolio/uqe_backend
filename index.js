@@ -48,35 +48,49 @@ const formatDateToYYYYMMDD = (date) => {
 };
 
 // Quality APIs using Long Term Supabase Source
-app.get('/api/quality/unique-article-numbers', async (req, res) => {
+app.get(['/api/quality/unique-article-numbers', '/api/long-term/unique-article-numbers'], async (req, res) => {
   try {
     const { q } = req.query;
-    let allArticles = [];
+    if (!q || q.length < 1) {
+      return res.json([]);
+    }
+
+    let allArticles = new Set();
     let from = 0;
     const step = 1000;
     let hasMore = true;
 
     while (hasMore) {
-      let query = supabaseLongTerm.from('uqe_data').select('ArticleNumber').range(from, from + step - 1);
+      let query = supabaseLongTerm
+        .from('uqe_data')
+        .select('ArticleNumber')
+        .ilike('ArticleNumber', `%${q}%`)
+        .range(from, from + step - 1);
       
-      if (q) {
-        query = query.ilike('ArticleNumber', `%${q}%`);
-      }
-
       const { data, error } = await query;
       if (error) throw error;
 
-      allArticles = allArticles.concat(data.map(item => item.ArticleNumber));
-      if (data.length < step) {
+      if (!data || data.length === 0) {
         hasMore = false;
       } else {
-        from += step;
+        data.forEach(item => {
+          if (item.ArticleNumber) {
+            allArticles.add(item.ArticleNumber);
+          }
+        });
+        
+        if (data.length < step) {
+          hasMore = false;
+        } else {
+          from += step;
+        }
       }
     }
     
-    const uniqueArticles = [...new Set(allArticles)].sort();
-    res.json(uniqueArticles);
+    const sortedArticles = [...allArticles].sort();
+    res.json(sortedArticles);
   } catch (error) {
+    console.error('Error fetching unique articles:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -101,58 +115,83 @@ app.get('/api/quality/data-by-article', async (req, res) => {
         .range(from, from + step - 1);
 
       if (error) throw error;
-      allData = allData.concat(data);
-      if (data.length < step) {
+      if (!data || data.length === 0) {
         hasMore = false;
       } else {
-        from += step;
+        allData = allData.concat(data);
+        if (data.length < step) {
+          hasMore = false;
+        } else {
+          from += step;
+        }
       }
     }
 
     res.json(allData);
   } catch (error) {
+    console.error('Error in /api/quality/data-by-article:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/quality/data', async (req, res) => {
+app.get(['/api/quality/data', '/api/long-term/data'], async (req, res) => {
   try {
     const { startDate, endDate, lotId, articles } = req.query;
+
+    // Check if at least one filter is provided
+    const hasDateFilter = startDate && endDate;
+    const hasLotFilter = lotId && lotId.trim().length > 0;
+    const hasArticleFilter = articles && articles.trim().length > 0;
+
+    if (!hasDateFilter && !hasLotFilter && !hasArticleFilter) {
+      return res.status(400).json({ error: 'At least one filter (Date Range, Lot ID, or Articles) is required' });
+    }
+
     let allData = [];
     let from = 0;
     const step = 1000;
     let hasMore = true;
 
     while (hasMore) {
-      let query = supabaseLongTerm.from('uqe_data').select('*').range(from, from + step - 1);
-
-      if (startDate && endDate) {
-        query = query.gte('ShiftStartTime', startDate).lte('ShiftStartTime', endDate);
+      let query = supabaseLongTerm.from('uqe_data').select('*');
+      
+      // Apply filters
+      if (hasDateFilter) {
+        // Use 'T23:59:59' to make the endDate inclusive of the whole day
+        query = query.gte('ShiftStartTime', `${startDate}T00:00:00`).lte('ShiftStartTime', `${endDate}T23:59:59`);
       }
 
-      if (lotId) {
-        const lots = lotId.split(',').map(l => l.trim());
-        query = query.in('LotID', lots);
+      if (hasLotFilter) {
+        const lots = lotId.split(',').map(l => l.trim()).filter(Boolean);
+        if (lots.length > 0) query = query.in('LotID', lots);
       }
 
-      if (articles) {
-        const artList = articles.split(',').map(a => a.trim());
-        query = query.in('ArticleNumber', artList);
+      if (hasArticleFilter) {
+        const artList = articles.split(',').map(a => a.trim()).filter(Boolean);
+        if (artList.length > 0) query = query.in('ArticleNumber', artList);
       }
+
+      // Add range for pagination
+      query = query.range(from, from + step - 1);
 
       const { data, error } = await query;
       if (error) throw error;
 
-      allData = allData.concat(data);
-      if (data.length < step) {
+      if (!data || data.length === 0) {
         hasMore = false;
       } else {
-        from += step;
+        allData = allData.concat(data);
+        if (data.length < step) {
+          hasMore = false;
+        } else {
+          from += step;
+        }
       }
     }
 
     res.json(allData);
   } catch (error) {
+    console.error('Error in long-term data API:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -186,7 +225,7 @@ const fetchAllUnitsData = async () => {
   cachedUnitsData = newData;
 };
 
-const getQuantumData = async (dateFilter = null, shiftFilter = null, unitFilter = null, machineFilter = null) => {
+const getQuantumData = async (dateFilter = null, shiftFilter = null, unitFilter = null, machineFilter = null, isDashboard = false) => {
   const units = unitFilter ? [unitFilter] : ['U-1', 'U-2', 'U-3', 'U-4', 'U-5', 'U-6'];
   
   // If no date or shift filter provided, find the latest available across all relevant units
@@ -209,8 +248,8 @@ const getQuantumData = async (dateFilter = null, shiftFilter = null, unitFilter 
       }))].filter(Boolean).sort().reverse();
 
       if (!targetDateStr && availableDates.length > 0) {
-        // Default to latest date for Home, Dashboard will handle yesterday default
-        targetDateStr = availableDates[0];
+        // Default to latest date for Home, Yesterday for Dashboard
+        targetDateStr = isDashboard ? (availableDates[1] || availableDates[0]) : availableDates[0];
       }
 
       if (targetDateStr) {
@@ -547,10 +586,11 @@ updateQuantumLiveData();
 setInterval(updateQuantumLiveData, 1800000); // Sync every 30 minutes
 
 app.get('/api/quantum/live', async (req, res) => {
-  const { date, shift, unit, machine } = req.query;
+  const { date, shift, unit, machine, mode } = req.query;
+  const isDashboard = mode === 'dashboard';
   
-  if (date || shift || unit || machine) {
-    const data = await getQuantumData(date, shift, unit, machine);
+  if (date || shift || unit || machine || isDashboard) {
+    const data = await getQuantumData(date, shift, unit, machine, isDashboard);
     res.json(data);
   } else if (cachedLiveData) {
     res.json(cachedLiveData);
@@ -918,81 +958,6 @@ app.post('/api/restart-server', async (req, res) => {
     res.json({ success: true, message: 'Server restart triggered successfully' });
   } catch (error) {
     console.error('Restart Server Error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/long-term/data', async (req, res) => {
-  try {
-    const { startDate, endDate, lotId, articles } = req.query;
-    let allData = [];
-    let from = 0;
-    const step = 1000;
-    let hasMore = true;
-
-    while (hasMore) {
-      let query = supabaseLongTerm.from('uqe_data').select('*').range(from, from + step - 1);
-
-      if (startDate && endDate) {
-        query = query.gte('ShiftStartTime', startDate).lte('ShiftStartTime', endDate);
-      }
-
-      if (lotId) {
-        const lots = lotId.split(',').map(l => l.trim());
-        query = query.in('LotID', lots);
-      }
-
-      if (articles) {
-        const artList = articles.split(',').map(a => a.trim());
-        query = query.in('ArticleNumber', artList);
-      }
-
-      const { data, error } = await query;
-      if (error) throw error;
-
-      allData = allData.concat(data);
-      if (data.length < step) {
-        hasMore = false;
-      } else {
-        from += step;
-      }
-    }
-
-    res.json(allData);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/long-term/unique-article-numbers', async (req, res) => {
-  try {
-    const { q } = req.query;
-    let allArticles = [];
-    let from = 0;
-    const step = 1000;
-    let hasMore = true;
-
-    while (hasMore) {
-      let query = supabaseLongTerm.from('uqe_data').select('ArticleNumber').range(from, from + step - 1);
-      
-      if (q) {
-        query = query.ilike('ArticleNumber', `%${q}%`);
-      }
-
-      const { data, error } = await query;
-      if (error) throw error;
-
-      allArticles = allArticles.concat(data.map(item => item.ArticleNumber));
-      if (data.length < step) {
-        hasMore = false;
-      } else {
-        from += step;
-      }
-    }
-    
-    const uniqueArticles = [...new Set(allArticles)].sort();
-    res.json(uniqueArticles);
-  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
