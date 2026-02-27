@@ -939,14 +939,19 @@ app.post('/api/change-password', async (req, res) => {
 
 app.post('/api/restart-server', async (req, res) => {
   try {
-    const serviceId = 'srv-d68887ur433s73cg6q1g';
+    const serviceId = process.env.RENDER_SERVICE_ID;
     const apiKey = process.env.RENDER_API_KEY;
+    const apiBaseUrl = process.env.RENDER_API_BASE_URL || 'https://api.render.com/v1';
 
     if (!apiKey || apiKey === 'your_render_api_key_here') {
       return res.status(500).json({ error: 'Render API key not configured' });
     }
 
-    const response = await fetch(`https://api.render.com/v1/services/${serviceId}/restart`, {
+    if (!serviceId) {
+      return res.status(500).json({ error: 'Render Service ID not configured' });
+    }
+
+    const response = await fetch(`${apiBaseUrl}/services/${serviceId}/restart`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
