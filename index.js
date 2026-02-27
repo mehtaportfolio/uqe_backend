@@ -203,35 +203,81 @@ app.get(['/api/quality/data', '/api/long-term/data'], async (req, res) => {
 
 // Quantum Dashboard Data (Supabase Storage)
 let cachedUnitsData = {}; // Store raw JSON data for each unit
+let lastFetchTimePerUnit = {}; // Track last fetch time for each unit
+let fetchingLocks = {}; // Prevent multiple concurrent fetches for the same unit
+let cachedQuantumResults = new Map(); // Cache for calculated results: key -> { timestamp, data }
 let cachedLiveData = null;
 let lastFetchTime = null;
 
-const fetchAllUnitsData = async () => {
-  const units = ['U-1', 'U-2', 'U-3', 'U-4', 'U-5', 'U-6'];
+const fetchSingleUnitData = async (unit) => {
+  if (fetchingLocks[unit]) return fetchingLocks[unit];
+
   const unitMap = {
     'U-1': '1.xlsx', 'U-2': '2.xlsx', 'U-3': '3.xlsx',
     'U-4': '4.xlsx', 'U-5': '5.xlsx', 'U-6': '6.xlsx'
   };
+  
+  const fileName = unitMap[unit];
+  if (!fileName) return [];
 
-  const newData = {};
-  await Promise.all(units.map(async (unit) => {
+  const fetchPromise = (async () => {
     try {
-      const { data, error } = await supabase.storage.from('uqe').download(unitMap[unit]);
+      console.log(`Fetching storage data for ${unit}...`);
+      const { data, error } = await supabase.storage.from('uqe').download(fileName);
       if (error) throw error;
+      
       const arrayBuffer = await data.arrayBuffer();
       const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: true });
       const sheetName = workbook.SheetNames[0];
-      newData[unit] = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+      const jsonData = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+      
+      cachedUnitsData[unit] = jsonData;
+      lastFetchTimePerUnit[unit] = new Date();
+      return jsonData;
     } catch (err) {
-      console.error(`Error caching ${unit}:`, err.message);
-      newData[unit] = cachedUnitsData[unit] || []; // Keep old data on error
+      console.error(`Error fetching/parsing ${unit}:`, err.message);
+      return cachedUnitsData[unit] || [];
+    } finally {
+      delete fetchingLocks[unit];
     }
-  }));
-  cachedUnitsData = newData;
+  })();
+
+  fetchingLocks[unit] = fetchPromise;
+  return fetchPromise;
+};
+
+const fetchAllUnitsData = async () => {
+  const units = ['U-1', 'U-2', 'U-3', 'U-4', 'U-5', 'U-6'];
+  // Parallel fetch is faster to populate the initial cache
+  await Promise.all(units.map(unit => fetchSingleUnitData(unit)));
 };
 
 const getQuantumData = async (dateFilter = null, shiftFilter = null, unitFilter = null, machineFilter = null, isDashboard = false) => {
   const units = unitFilter ? [unitFilter] : ['U-1', 'U-2', 'U-3', 'U-4', 'U-5', 'U-6'];
+  
+  // Use cache key to skip re-calculating if data hasn't changed
+  const cacheKey = `${dateFilter}-${shiftFilter}-${unitFilter}-${machineFilter}-${isDashboard}`;
+  const RESULT_CACHE_TTL = 5 * 60 * 1000; // 5 minute results cache
+  const STORAGE_TTL = 15 * 60 * 1000; // 15 minute storage cache
+
+  // Check results cache first
+  const cachedResult = cachedQuantumResults.get(cacheKey);
+  if (cachedResult && (Date.now() - cachedResult.timestamp < RESULT_CACHE_TTL)) {
+    // Check if any underlying unit data needs refresh
+    const needsRefresh = units.some(u => {
+      const lastFetch = lastFetchTimePerUnit[u];
+      return !cachedUnitsData[u] || !lastFetch || (Date.now() - lastFetch.getTime() > STORAGE_TTL);
+    });
+    if (!needsRefresh) return cachedResult.data;
+  }
+
+  // Ensure we have data for the requested units
+  for (const unit of units) {
+    const lastFetch = lastFetchTimePerUnit[unit];
+    if (!cachedUnitsData[unit] || !lastFetch || (Date.now() - lastFetch.getTime() > STORAGE_TTL)) {
+      await fetchSingleUnitData(unit);
+    }
+  }
   
   // If no date or shift filter provided, find the latest available across all relevant units
   let targetDateStr = dateFilter;
@@ -572,6 +618,7 @@ const getQuantumData = async (dateFilter = null, shiftFilter = null, unitFilter 
       };
     });
 
+    cachedQuantumResults.set(cacheKey, { timestamp: Date.now(), data: results });
     return results;
   } catch (error) {
     console.error("Failed to process quantum data:", error.message);
